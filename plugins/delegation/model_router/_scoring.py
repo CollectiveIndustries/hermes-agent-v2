@@ -117,19 +117,46 @@ def final_score(
 
     0.4 base + 0.3 overall-learned + 0.3 task-learned  (when we have both, non-zero sample counts)
     0.5 base + 0.5 overall-learned                     (when only overall, non-zero sample counts)
-    base                                          (cold start — no sample data yet)
+    base - truncation_penalty                           (cold start — no sample data yet)
+
+    `truncation_ema` is tracked in `learned` and penalized to deprioritize
+    endpoints that frequently truncate their streams.
     """
     b = base_score(base)
     l = learned_score(learned) if learned else None
     tl = learned_score(task_learned) if task_learned else None
 
+    # Extract truncation data
+    trunc_ema = max(0.0, min(1.0, (learned or {}).get("truncation_ema", 0.0)))
+    sample_count = int((learned or {}).get("sample_count", 0))
+    trunc_pen = truncation_penalty(trunc_ema, sample_count)
+
     if l is not None and tl is not None:
-        return 0.4 * b + 0.3 * l + 0.3 * tl
+        return 0.4 * b + 0.3 * l + 0.3 * tl - trunc_pen
     if l is not None:
-        return 0.5 * b + 0.5 * l
-    return b
+        return 0.5 * b + 0.5 * l - trunc_pen
+    return b - trunc_pen
 
 
 def update_ema(old: float, new: float) -> float:
     """Standard EMA update with the module's alpha."""
     return (1 - EMA_ALPHA) * old + EMA_ALPHA * new
+
+
+def truncation_penalty(truncation_ema: float, sample_count: int) -> float:
+    """Penalize endpoints that frequently truncate their streams.
+
+    0.0 → 1.0 (truncation rate)
+    - 10% truncation: 0 penalty
+    - 75% truncation: 0.4 penalty (25% of total score)
+
+    Applied to final_score to reduce routing to unstable streamers.
+    """
+    if sample_count < 3:
+        return 0.0  # not enough data
+    if truncation_ema <= 0.1:
+        return 0.0
+    if truncation_ema >= 0.75:
+        return 0.4
+    # Linear scaling between 0.1 and 0.75
+    return min(0.4, max(0.0, ((truncation_ema - 0.1) / 0.65) * 0.4))

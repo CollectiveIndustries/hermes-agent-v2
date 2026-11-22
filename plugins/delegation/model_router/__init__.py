@@ -182,8 +182,11 @@ class ModelRouterProvider(DelegationProvider):
         }
 
     # ── learning hooks ────────────────────────────────────────────────────────
-    def _observe(self, endpoint_id: Optional[str], task_id: str, *,
-                 ok: bool, latency_ms: float = 0.0, tokens_s: float = 0.0) -> None:
+    def _observe(
+        self, endpoint_id: Optional[str], task_id: str, *,
+        ok: bool, latency_ms: float = 0.0, tokens_s: float = 0.0,
+        truncated: bool = False,
+    ) -> None:
         with self._lock:
             if not endpoint_id:
                 return
@@ -225,6 +228,13 @@ class ModelRouterProvider(DelegationProvider):
             if tokens_s > 0:
                 learned["tokens_s"] = sc.update_ema(
                     learned.get("tokens_s") or 50.0, tokens_s)
+            # Update truncation tracking
+            if truncated:
+                curr_trunc = learned.get("truncation_ema", 0.0)
+                learned["truncation_ema"] = sc.update_ema(curr_trunc, 1.0)
+            else:
+                curr_trunc = learned.get("truncation_ema", 0.0)
+                learned["truncation_ema"] = sc.update_ema(curr_trunc, 0.0)
 
             # Update task-level learned.
             ts = ep.setdefault("task_scores", {}).setdefault(task_id, {
@@ -295,15 +305,32 @@ class ModelRouterProvider(DelegationProvider):
             endpoint_id = self._endpoint_id_for_call(kwargs)
             if not endpoint_id:
                 return
-            ok = kwargs.get("error") is None and bool(kwargs.get("response") is not None or
-                                                         kwargs.get("assistant_content_chars"))
+            error = kwargs.get("error")
+            truncated = False
+            if not error:
+                # Detect stream truncation
+                # A truncated stream = response exists but was cut short
+                # (common signals: finish_reason != "stop" AND usage.output_tokens
+                #  is near the max, OR response is shorter than expected, OR
+                #  the client reported a timeout/EOF.)
+                response = kwargs.get("response") or {}
+                finish_reason = response.get("finish_reason") if isinstance(response, dict) else None
+                # If we got a response but it was truncated, flag it
+                if finish_reason and finish_reason not in ("stop", "end_turn"):
+                    truncated = True
+
+            ok = (error is None) and not truncated
             latency_ms = float(kwargs.get("api_duration") or 0) * 1000.0
             usage = kwargs.get("usage") or {}
             out_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
             tokens_s = (out_tokens / (latency_ms / 1000.0)) if (latency_ms > 0 and out_tokens) else 0.0
             # We don't always know the task in post_api_request (that's the main loop)
             # so we treat it as a generic "code" observation.
-            self._observe(endpoint_id, "code", ok=ok, latency_ms=latency_ms, tokens_s=tokens_s)
+            self._observe(
+                endpoint_id, "code",
+                ok=ok, latency_ms=latency_ms, tokens_s=tokens_s,
+                truncated=truncated,
+            )
             self._maybe_save()
         except Exception:
             logger.debug("model-router: observe_post_api_request failed", exc_info=True)
