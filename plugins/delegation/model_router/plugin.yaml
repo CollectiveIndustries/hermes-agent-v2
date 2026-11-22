@@ -1,0 +1,5 @@
+name: model-router
+version: 1.0.0
+description: "Task-centric delegation routing: picks the best endpoint for each delegate_task based on template base score (grade, speed, tools) + empirical success/latency/tokens-s learned from live traffic. State at ~/.hermes/model_routing_state.json."
+author: admiral
+kind: backend
